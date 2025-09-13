@@ -10,6 +10,8 @@ import csv
 import asyncio
 import logging
 import time
+import signal
+import sys
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime
@@ -56,7 +58,48 @@ class BioGenerator:
         logger.info("[INIT] Initializing BioGenerator with Claude API")
         self.client = Anthropic(api_key=api_key)
         self.generated_bios: List[PersonBio] = []
+        self.interrupt_requested = False
         logger.info("[INIT] BioGenerator initialized successfully")
+    
+    def save_progress(self, results: List[Dict[str, Any]], output_path: Path):
+        """Save current progress to file."""
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+            logger.info(f"[SAVE] Progress saved: {len(results)} bios")
+        except Exception as e:
+            logger.error(f"[ERROR] Failed to save progress: {e}")
+    
+    def signal_handler(self, signum, frame):
+        """Handle interrupt signals gracefully."""
+        logger.info("[INTERRUPT] Received interrupt signal, finishing current bio...")
+        self.interrupt_requested = True
+    
+    def load_existing_bios(self, output_path: Path) -> List[Dict[str, Any]]:
+        """Load existing generated bios from file if it exists."""
+        if not output_path.exists():
+            logger.info("[RESUME] No existing output file found, starting fresh")
+            return []
+        
+        try:
+            with open(output_path, 'r', encoding='utf-8') as f:
+                existing_bios = json.load(f)
+            logger.info(f"[RESUME] Loaded {len(existing_bios)} existing bios from {output_path}")
+            return existing_bios
+        except Exception as e:
+            logger.error(f"[ERROR] Failed to load existing bios: {e}")
+            return []
+    
+    def create_processed_set(self, existing_bios: List[Dict[str, Any]]) -> set:
+        """Create a set of (role, industry) tuples for already processed entries."""
+        processed = set()
+        for bio in existing_bios:
+            role = bio.get('role', '').strip().lower()
+            industry = bio.get('industry', '').strip().lower()
+            if role and industry:
+                processed.add((role, industry))
+        logger.info(f"[RESUME] Created processed set with {len(processed)} unique role/industry combinations")
+        return processed
     
     def generate_bio(self, role: str, industry: str, location: str = "") -> Optional[PersonBio]:
         """Generate a simulated bio for a person based on role and industry."""
@@ -130,10 +173,21 @@ class BioGenerator:
             logger.error(f"Error type: {type(e).__name__}")
             return None
     
-    def process_csv(self, csv_path: Path, output_path: Path, max_rows: Optional[int] = None):
-        """Process CSV file and generate bios for each row."""
+    def process_csv(self, csv_path: Path, output_path: Path, max_rows: Optional[int] = None, resume: bool = True):
+        """Process CSV file and generate bios for each row with resume capability."""
         
         logger.info(f"[CSV] Starting CSV processing from: {csv_path}")
+        
+        # Set up signal handler for graceful shutdown
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+        
+        # Load existing bios for resume capability
+        existing_bios = []
+        processed_set = set()
+        if resume:
+            existing_bios = self.load_existing_bios(output_path)
+            processed_set = self.create_processed_set(existing_bios)
         
         try:
             df = pd.read_csv(csv_path)
@@ -148,9 +202,11 @@ class BioGenerator:
         
         logger.info(f"[CSV] CSV columns: {list(df.columns)}")
         
-        results = []
-        processed_count = 0
+        # Start with existing bios if resuming
+        results = existing_bios.copy()
+        processed_count = len(existing_bios)
         skipped_count = 0
+        resume_skipped = 0
         
         for idx, row in df.iterrows():
             role = str(row.get('Role / Job Title', '')).strip()
@@ -162,6 +218,14 @@ class BioGenerator:
             if not role or role == '-' or not industry or industry == 'nan':
                 logger.warning(f"[SKIP] Skipping row {idx+1}: empty role or industry")
                 skipped_count += 1
+                continue
+            
+            # Check if already processed (resume capability)
+            role_key = role.lower()
+            industry_key = industry.lower()
+            if resume and (role_key, industry_key) in processed_set:
+                logger.info(f"[RESUME] Skipping row {idx+1}: already processed '{role}' in '{industry}'")
+                resume_skipped += 1
                 continue
             
             # Create location string
@@ -181,10 +245,24 @@ class BioGenerator:
                 processed_count += 1
                 logger.info(f"[SUCCESS] [{processed_count}] Successfully generated bio for '{role}'")
                 
+                # Add to processed set for future resume operations
+                processed_set.add((role_key, industry_key))
+                
+                # Save progress every 10 bios
+                if processed_count % 10 == 0:
+                    self.save_progress(results, output_path)
+                
                 # Add a small delay to be respectful to API
                 time.sleep(0.5)
             else:
                 logger.error(f"[ERROR] Failed to generate bio for '{role}' in '{industry}'")
+            
+            # Check for interrupt request
+            if self.interrupt_requested:
+                logger.info("[INTERRUPT] Saving progress and exiting gracefully...")
+                self.save_progress(results, output_path)
+                logger.info(f"[INTERRUPT] Saved {len(results)} bios before exit")
+                return results
         
         # Save results
         logger.info(f"[SAVE] Saving {len(results)} bios to: {output_path}")
@@ -196,7 +274,7 @@ class BioGenerator:
             logger.error(f"[ERROR] Failed to save results: {e}")
             return results
         
-        logger.info(f"[COMPLETE] Processing complete! Generated: {processed_count}, Skipped: {skipped_count}")
+        logger.info(f"[COMPLETE] Processing complete! Generated: {processed_count}, Skipped: {skipped_count}, Resume skipped: {resume_skipped}")
         return results
 
 
@@ -234,9 +312,9 @@ def main():
     # Initialize generator
     generator = BioGenerator(api_key)
     
-    # Process CSV (limit to 5 for testing with enhanced logging)
+    # Process CSV (full dataset - remove max_rows limit)
     logger.info("[START] Starting bio generation process...")
-    results = generator.process_csv(csv_path, output_path, max_rows=5)
+    results = generator.process_csv(csv_path, output_path, max_rows=None)
     
     end_time = datetime.now()
     duration = end_time - start_time
